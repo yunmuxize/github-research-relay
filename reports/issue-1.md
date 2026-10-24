@@ -6,7 +6,7 @@ COMPLETED
 ## Revisions and environment
 - Task Issue URL: https://github.com/yunmuxize/github-research-relay/issues/1
 - Base SHA: `5a991ff227cb5421c7c20facc11a101dc7ab3ba7`
-- Implementation SHA: (filled after commit)
+- Implementation SHA: `fede40ef8375e79ec2417b3f0e37a050571bbb33`
 - Runtime dependencies / configuration: none — documentation-only change
 - Worker host: H200 (234SafeSim), Ubuntu 22.04, `git` 2.x, `gh` 2.x
 - Worker skill: `research-relay-worker` (installed at `~/.config/opencode/skills/research-relay-worker/SKILL.md`)
