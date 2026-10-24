@@ -41,8 +41,12 @@ When the user asks to persist the agreed next step (e.g. "把下一轮任务写�
 3. Create a **small, independently verifiable** Issue with: motivation/problem; background and evidence (links + exact revisions); working hypothesis; scope and non-goals; exact inputs/code baseline/branch or commit SHA; required work; runnable evaluation protocol; quantitative acceptance criteria and correctness checks; requested evidence; deliverables; explicit stop/ask conditions; related issues; output contract (branch + PR + report channel).
 4. Keep proposed work research-driven. Separate established evidence, tentative inference, and untested assumptions. Prohibit fabricated experimental results.
 5. **Apply `relay:ready` only after the task is concrete enough to execute.** Do not label an incomplete task as ready.
-6. Use the GitHub URL as the compact hand-off artifact, then tell the user what was posted and its URL. Do not paste the full prompt into chat unless requested. Do not claim an Issue was created unless the tool confirms it.
-7. Never auto-dispatch a second task while the prior task has unresolved critical failures unless the user asked for parallel independent tasks.
+6. **Post an attempt-1 marker** so the first round of worker claims is epoch-scoped:
+   ```bash
+   gh issue comment N -R OWNER/REPO --body "<!-- relay:attempt attempt=1 -->"
+   ```
+7. Use the GitHub URL as the compact hand-off artifact, then tell the user what was posted and its URL. Do not paste the full prompt into chat unless requested. Do not claim an Issue was created unless the tool confirms it.
+8. Never auto-dispatch a second task while the prior task has unresolved critical failures unless the user asked for parallel independent tasks.
 
 ### Suggested Issue body
 
@@ -90,10 +94,15 @@ When the user asks to review (e.g. "验收一下结果", "review the relay PR"):
 ### On REWORK
 
 - Post numbered, testable change requests on the **existing** PR/Issue (smallest corrective request; no broad redesign by default).
-- Transition the Issue **back to `relay:ready`** so the next "接一轮新任务" resumes that same PR:
+- **Post an attempt-marker comment** to start the next claim epoch, then transition the Issue **back to `relay:ready`** so the next "接一轮新任务" resumes that same PR:
   ```bash
+  # Determine the next attempt number (highest existing attempt + 1)
+  ATTEMPT=$(gh api "repos/OWNER/REPO/issues/N/comments" --jq '[.[] | select(.body|test("relay:attempt")) | capture("attempt=(?<n>[0-9]+)") | .n | tonumber] | max // 0' 2>/dev/null)
+  ATTEMPT=$((ATTEMPT + 1))
+  gh issue comment N -R OWNER/REPO --body "<!-- relay:attempt attempt=$ATTEMPT -->"
   gh issue edit N -R OWNER/REPO --remove-label "relay:review" --add-label "relay:ready"
   ```
+  The attempt marker scopes the next round of worker claims to this attempt only, so prior-round claims do not permanently block new workers.
 - Do not create a separate ready Issue for the rework — that would fork the queue. Create a separate ready Issue only for genuinely new work.
 - Do not silently merge, delete, force-push, approve irreversible infrastructure changes, or disclose private datasets. Only merge if authorized by the user and repository policies.
 

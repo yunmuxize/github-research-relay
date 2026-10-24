@@ -39,55 +39,78 @@ The Controller manages these labels (create idempotently if missing):
 - `relay:blocked` — the task is waiting for clarification or user action.
 - `relay:done` — Controller accepted the result. Issue stays open unless the user explicitly asks to close it.
 
+## Attempt markers (epoch for claims)
+
+Each time an Issue enters `relay:ready` — whether on initial creation or on Controller rework (`relay:review` → `relay:ready`) — the actor that performs the transition **must post an attempt-marker comment**:
+
+```bash
+# The Controller posts this when transitioning to relay:ready (initial or rework)
+ATTEMPT=<next attempt number, starting at 1>
+gh issue comment N -R OWNER/REPO --body "<!-- relay:attempt attempt=$ATTEMPT -->"
+```
+
+- Attempt 1 = initial task. Each Controller rework increments the attempt by 1.
+- If no attempt marker exists (e.g. a pre-existing ready Issue from before this protocol), the Worker treats the Issue creation as attempt 1 and posts the marker itself before claiming.
+- The **current attempt** for an Issue = the highest `attempt=` value among all `relay:attempt` comments. Workers only compete within the current attempt.
+
 ## Task selection
 
 1. **Explicit Issue URL wins.** If given `OWNER/REPO/issues/N`, process only that Issue (skip queue search).
-2. **"接一轮新任务" / "pick the next ready task"** — resolve the default repository (above), then search only Issues labeled `relay:ready`:
+2. **"接一轮新任务" / "pick the next ready task"** — resolve the default repository (above), then search only Issues labeled `relay:ready`, sorted ascending by number to guarantee FIFO:
    ```bash
-   gh issue list -R OWNER/REPO --label "relay:ready" --state open --json number,title --limit 50
+   gh issue list -R OWNER/REPO --label "relay:ready" --state open --search "sort:created-asc" --json number,title
    ```
+   Then sort the result client-side ascending by `number` and pick the first. The `--search "sort:created-asc"` plus client-side sort guarantees the lowest-numbered Issue wins regardless of API return order.
 3. **Select exactly one: the lowest-numbered ready Issue (FIFO).** Never pick unlabelled historical Issues or Issues in `relay:review` / `relay:done` / `relay:blocked` states.
 4. **Empty queue → report and stop.** If no `relay:ready` Issue exists, say so and perform no work. Do not invent work or relax the filter.
 5. **Handle exactly one Issue per invocation.** Do not automatically start a second task after finishing the first.
+6. **Queue bound:** if more than 200 Issues are labeled `relay:ready`, the Controller should not create excess ready tasks; the Worker fetches up to 200 and sorts client-side. This is a documented bounded-queue contract, not an unbounded FIFO claim.
 
-## Claiming a task (exclusive, race-safe)
+## Claiming a task (exclusive, epoch-scoped)
 
-A label transition alone is **not** a compare-and-swap lock: two workers can both observe `relay:ready`, both apply `relay:in-progress`, and both believe they own the task. Use a GitHub-native **claim-comment protocol** that identifies a single winner by the earliest claim comment.
+A label transition alone is **not** a compare-and-swap lock: two workers can both observe `relay:ready`, both apply `relay:in-progress`, and both believe they own the task. Use a GitHub-native **claim-comment protocol** that identifies a single winner by the earliest claim comment **within the current attempt**.
 
 ### Claim protocol
 
-Each worker generates a unique claim token (e.g. `worker-<hostname>-<pid>-<epoch-ns>`) and proceeds:
-
-1. **Post a claim comment** as an HTML comment (hidden in rendered UI, machine-readable) carrying the token and an ISO-8601 timestamp:
+1. **Determine the current attempt** for the Issue (see Attempt markers). If no `relay:attempt` marker exists, post `<!-- relay:attempt attempt=1 -->` and use attempt 1.
+2. **Post a claim comment** as an HTML comment carrying the token, the attempt number, and an ISO-8601 timestamp:
    ```bash
    TOKEN="worker-$(hostname)-$$-$(date +%s%N)"
    TS=$(date -u +%Y-%m-%dT%H:%M:%SZ)
-   gh issue comment N -R OWNER/REPO --body "<!-- relay:claim token=$TOKEN ts=$TS -->"
+   ATTEMPT=<current attempt number>
+   gh issue comment N -R OWNER/REPO --body "<!-- relay:claim token=$TOKEN attempt=$ATTEMPT ts=$TS -->"
    ```
-2. **Re-read all `relay:claim` comments** on the Issue, sorted by GitHub's `created_at` (then by comment `id` to break exact ties):
+3. **Re-read all `relay:claim` comments for the current attempt only**, sorted by GitHub's `created_at` (then by comment `id` to break exact ties):
    ```bash
    gh api "repos/OWNER/REPO/issues/N/comments" --jq \
-     '[.[] | select(.body|test("relay:claim")) | {id:.id, created_at:.created_at, body:.body}] | sort_by(.created_at, .id)'
+     "[.[] | select(.body|test(\"relay:claim\")) | select(.body|test(\"attempt=$ATTEMPT\")) | {id:.id, created_at:.created_at, body:.body}] | sort_by(.created_at, .id)"
    ```
-3. **Winner = the worker whose token appears in the earliest claim comment.** Only the winner proceeds:
+   **Only claims with `attempt=<current>` are considered.** Prior-attempt claims are invisible to this round — this is what makes rework work (see below).
+4. **Winner = the worker whose token appears in the earliest claim comment for the current attempt.** Only the winner proceeds:
    - The winner transitions the label `relay:ready` → `relay:in-progress` and begins work on the task branch.
-   - Every other worker's token is **not** in the earliest comment; those workers **stop immediately**, post nothing further, and report that they lost the race to the winning token. They do not touch the task branch.
-4. **Exclusivity guarantee:** GitHub assigns monotonically increasing comment IDs and timestamps, so exactly one comment is earliest. No two workers can both pass the "my token is earliest" check. This was verified by a concurrent two-process test (see PR evidence).
+   - Every other worker's token is **not** in the earliest comment for this attempt; those workers **stop immediately**, post nothing further, and report that they lost the race to the winning token. They do not touch the task branch.
+5. **Exclusivity guarantee:** GitHub assigns monotonically increasing comment IDs and timestamps, so exactly one comment is earliest within an attempt. No two workers can both pass the "my token is earliest (in this attempt)" check. Prior-attempt claims do not compete because they are filtered out by `attempt=`.
 
-### Stale-claim recovery
+### Why this fixes the rework problem
 
-A winning worker may crash after claiming but before completing. Recovery rules:
+Without attempt-scoping, the earliest claim comment across **all** history would permanently win every round. With attempt markers:
+- Round 1 (attempt 1): Workers A and B post claims with `attempt=1`. A wins (earliest), completes a PR, transitions to `relay:review`.
+- Controller rework: transitions `relay:review` → `relay:ready` and posts `<!-- relay:attempt attempt=2 -->`.
+- Round 2 (attempt 2): Worker C posts a claim with `attempt=2`. The winner check filters to `attempt=2` only, so C's claim is the earliest (and only) claim in this attempt — C wins. Round 1's claims (attempt=1) are irrelevant. This was the failure mode in the prior PR version; it is now fixed.
 
-- A claim comment older than a configurable staleness threshold (default **24 hours**) on an Issue still labeled `relay:in-progress` with no open PR and no recent non-claim activity is considered **stale**.
-- Any worker (or the Controller) may recover a stale claim by posting a new claim comment and re-running the winner check. The new claim becomes the earliest *active* claim; the prior stale claim comment remains in history as an audit trail.
-- A worker that recovers a stale claim must comment on the Issue noting the recovery and the prior stale token, so the original claimant can detect the handoff if it resumes.
-- Do **not** silently steal a fresh (non-stale) claim. If the current claim is younger than the threshold and the Issue is `relay:in-progress`, leave it alone.
+### Stale / crashed claims — manual recovery only
+
+A winning worker may crash after claiming but before completing. **Automatic time-based recovery is not safe** — elapsed time alone does not prove the original process has stopped, and the original worker could resume and push to the branch after a takeover. Therefore:
+
+- **Do not auto-recover a stale claim.** If a worker observes an `relay:in-progress` Issue whose winning claim is old and no open PR exists, it may **report** this to the Controller (post a comment noting the potentially stale claim and its age) but must **not** take over the task.
+- **Recovery requires Controller authorization:** the Controller reviews the situation, transitions the Issue to `relay:blocked` (if the original worker should be contacted) or posts a new `relay:attempt` marker and transitions back to `relay:ready` (if the original worker is confirmed gone). Only then does a new worker claim within the new attempt.
+- This is an explicit limitation: **concurrent recovery from a crashed claim is not supported without Controller authorization.** The design prioritizes safety over automatic healing.
 
 ### Release / transition
 
 - On successful PR submission: winner transitions `relay:in-progress` → `relay:review` (see State transitions). The claim comment stays as audit trail; it is not deleted.
 - On blocked: winner transitions `relay:in-progress` → `relay:blocked` and posts the blocking question.
-- On Controller rework: Controller transitions `relay:review` → `relay:ready`. The next "接一轮新任务" run posts a **new** claim comment and re-runs the winner check (the prior claim is now stale relative to the new rework cycle).
+- On Controller rework: Controller transitions `relay:review` → `relay:ready` and posts a new `relay:attempt` marker (incremented). The next "接一轮新任务" run posts a claim with the new attempt number and competes only within that attempt.
 - Never merge, self-approve, or close the Issue. Never force-push.
 
 ## Reading the task contract
@@ -99,13 +122,13 @@ A winning worker may crash after claiming but before completing. Recovery rules:
    gh repo view OWNER/REPO --json defaultBranchRef,isPrivate
    ```
 3. Briefly restate the target, exclusions, exact inputs, test commands, and acceptance criteria; mark missing details as unknown. If the Issue is closed, stale, incompatible with repo state, or ambiguous in a correctness-critical way, stop and post a question rather than improvising.
-4. **Rework vs. new work** — check for an existing open PR linked to this Issue. The `linked:issue` search is unreliable on some `gh` versions; prefer the head-branch lookup, with the linked-issue search as a fallback:
+4. **Rework vs. new work** — check for an existing open PR on a branch named `agent/issue-NUMBER-*`. The `--head` flag does **not** support wildcard matching on all `gh` versions; list all open PRs and filter client-side:
    ```bash
-   # Primary: look for an existing branch named agent/issue-NUMBER-*
-   gh pr list -R OWNER/REPO --head "agent/issue-NUMBER-*" --state open --json number,headRefName,state
-   # Fallback: search by linked issue (works on some gh versions)
-   gh pr list -R OWNER/REPO --search "linked:issue NUMBER state:open" --json number,headRefName,state
+   # List all open PRs, filter client-side for branches matching agent/issue-NUMBER-
+   gh api repos/OWNER/REPO/pulls --paginate --jq \
+     "[.[] | select(.state==\"open\") | select(.head.ref | test(\"^agent/issue-NUMBER-\")) | {number, head_ref:.head.ref, state}]"
    ```
+   Replace `NUMBER` with the actual Issue number in the regex. This is an exact, API-supported lookup — no wildcard assumption.
    - If an open PR exists, this is a **rework request**: continue on that same branch/PR. Do not open a duplicate PR or a new branch.
    - If no open PR exists, create a new `agent/issue-NUMBER-short-name` branch from the required revision (base default branch only if no revision is specified). Avoid direct pushes to `main`/`master`, unsafe force-pushes, and writing to another agent's branch.
 
