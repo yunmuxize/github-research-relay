@@ -85,46 +85,40 @@ A label transition alone is **not** a compare-and-swap lock: two workers can bot
 
 ### Claim protocol
 
-1. **Determine the current attempt** for the Issue (see Attempt markers). If no `relay:attempt` marker exists and the Issue is a legacy ready Issue, the Worker posts `<!-- relay:attempt attempt=1 -->` and uses attempt 1 — but it must **not** silently initialize a prior rework cycle as attempt 1 without auditing comment history; if comments suggest prior rounds, transition the Issue to `relay:blocked` and ask the Controller to post the correct attempt marker instead.
-2. **Generate a random opaque claim token** (do NOT use hostnames or PII — use a random hex string):
+1. **Determine the current attempt** for the Issue (see Attempt markers). If no `relay:attempt` marker exists and the Issue is a legacy ready Issue, the Worker must audit comment history first; if comments suggest prior rework rounds, transition the Issue to `relay:blocked` and ask the Controller to post the correct attempt marker. Only if history is clearly empty may the Worker post `<!-- relay:attempt attempt=1 -->` and use attempt 1.
+2. **Generate a random opaque claim token** (do NOT use hostnames or PII — use a random hex string). This token goes ONLY in the audit comment, never in the lock ref name:
    ```bash
    TOKEN=$(head -c 16 /dev/urandom | xxd -p)
    ```
-3. **Atomically create the claim ref.** The ref name encodes issue + attempt + token:
+3. **Atomically create the fixed-name lock ref.** The ref name is fixed per (issue, attempt) — it does NOT contain the token. Exactly one worker can create this ref; all others get 422:
    ```bash
-   REF="refs/relay/issue-N/attempt-K/claim-$TOKEN"   # N=issue number, K=current attempt
+   REF="refs/relay/issue-N/attempt-K"   # N=issue number, K=current attempt; FIXED name
    BASE_SHA=$(gh api repos/OWNER/REPO/git/refs/heads/main --jq '.object.sha')
    PAYLOAD=$(printf '{"ref":"%s","sha":"%s"}' "$REF" "$BASE_SHA")
-   echo "$PAYLOAD" | gh api -X POST repos/OWNER/REPO/git/refs --input - 2>&1
+   RESP=$(echo "$PAYLOAD" | gh api -X POST repos/OWNER/REPO/git/refs --input - 2>&1)
    ```
-   - If the response is `201 Created`: **you are the exclusive winner** of this (issue, attempt). Exactly one worker can reach this state per (issue, attempt) — the ref namespace `refs/relay/issue-N/attempt-K/` is the lock.
-   - If the response is `422 Reference already exists`: **another worker already claimed this (issue, attempt)**. Stop immediately; do not touch the task branch, do not post a claim comment. Report that you lost the race.
+   - If `RESP` contains `"201"` / `"Created"` / starts with `{"ref":` (HTTP 201): **you are the exclusive winner** of this (issue, attempt). The fixed ref name guarantees exactly one creator — a second worker POSTing the same ref gets 422, not 201.
+   - If `RESP` contains `"422"` and `"Reference already exists"`: **another worker already claimed this (issue, attempt)**. Stop immediately; do not touch the task branch, do not post a claim comment. Report that you lost the race.
+   - Any other response (5xx, network error, unexpected body): **do not assume you won or lost.** Stop and report the raw response to the Controller; do not proceed with branch work.
 4. **Post a claim-comment audit record** (only the winner does this, after the ref is created):
    ```bash
    gh issue comment N -R OWNER/REPO --body "<!-- relay:claim token=$TOKEN attempt=$K ref=$REF ts=$(date -u +%Y-%m-%dT%H:%M:%SZ) -->"
    ```
 5. **Winner transitions the label** `relay:ready` → `relay:in-progress` and begins work on the task branch.
-6. **Exclusivity guarantee:** GitHub ref creation is an atomic compare-and-set at the ref namespace. Two workers racing to create `refs/relay/issue-N/attempt-K/claim-<tokenA>` and `...claim-<tokenB>` create *different* refs (different token suffix) — but the winner check is: scan `refs/relay/issue-N/attempt-K/*` and the single existing ref identifies the winner. To make this a single-winner lock, the winner is the worker whose ref exists after the race; losers detect they are not the winner by listing the namespace. Equivalently, a simpler single-ref lock uses a fixed ref name per (issue, attempt) and the token goes only in the comment:
+6. **Exclusivity guarantee:** GitHub ref creation is an atomic compare-and-set. The ref name `refs/relay/issue-N/attempt-K` is fixed per (issue, attempt), so exactly one `POST` returns 201; all concurrent POSTs of the same ref return 422. This is a true atomic lock — no two workers can both win. (A worker that ignores the protocol and pushes to the branch directly is outside this skill's defense; repository branch-protection rules would be needed for that.)
+
+### Determining the winner / verifying ownership (before branch writes)
+
+Before any branch write or push, a worker re-verifies ownership:
+
+1. **Re-check the current attempt** by fetching all comments (paginated, see below) and computing the max integer attempt. If the current attempt has advanced beyond K (Controller posted a new attempt marker), the worker's claim is stale → **fail closed**: stop, do not push, post a comment noting the attempt advanced.
+2. **Re-check the lock ref exists and points at the expected commit lineage:**
    ```bash
-   # Preferred single-ref lock: exactly one creator wins
-   LOCK_REF="refs/relay/issue-N/attempt-K"   # fixed name per (issue, attempt)
-   echo "{\"ref\":\"$LOCK_REF\",\"sha\":\"$BASE_SHA\"}" | gh api -X POST repos/OWNER/REPO/git/refs --input -
+   gh api "repos/OWNER/REPO/git/refs/relay/issue-N/attempt-K" --jq '.ref, .object.sha' 2>&1
+   # 404 -> lock ref gone (Controller handover or cleanup) -> fail closed
+   # 200 -> verify the SHA is an ancestor of your branch HEAD
    ```
-   - `201 Created` → you are the sole winner. Record your token in a claim comment.
-   - `422 Reference already exists` → you lost. Stop.
-   This is a true atomic lock: the ref name is fixed per (issue, attempt), so exactly one `POST` succeeds.
-
-### Determining the winner / verifying ownership
-
-A worker that needs to verify who owns the current attempt lists the lock ref:
-
-```bash
-gh api "repos/OWNER/REPO/git/refs/relay/issue-N/attempt-K" --jq '.ref, .object.sha' 2>&1
-# 404 -> no one has claimed this attempt yet
-# 200 -> the ref exists; the winner is the worker whose token is in the earliest relay:claim comment with attempt=K
-```
-
-Before any branch write, a worker re-verifies the lock ref still exists and points at the expected commit lineage. If the lock ref has been deleted (see Release below) the claim is no longer valid.
+3. Only if both checks pass does the worker proceed with the branch write.
 
 ### Stale / crashed claims — manual recovery only
 
@@ -143,17 +137,39 @@ A winning worker may crash after creating the lock ref but before completing. **
 
 ### Reading all comments (pagination)
 
-Issue comments are paginated (GitHub default 30/page). All reads of `relay:attempt` markers and `relay:claim` audit records MUST fetch all pages in a single global reduction, not page-by-page:
+Issue comments are paginated (GitHub default 30/page). All reads of `relay:attempt` markers and `relay:claim` audit records MUST fetch all pages and perform ONE global reduction over the combined data. Do **not** rely on `--paginate --jq` applying a single global aggregation, because some `gh` versions apply `--jq` per page and emit multiple values.
+
+Use this two-step pattern: fetch all pages to a single file, then run jq once globally:
 
 ```bash
-# Fetch ALL comments, then reduce in one pass
-gh api "repos/OWNER/REPO/issues/N/comments" --paginate --jq \
-  '[.[] | {id:.id, created_at:.created_at, body:.body}]' \
-  > /tmp/issue-N-comments.json
-# Then parse attempt markers and claim records from the full file
+# Step 1: fetch ALL comment pages into one file.
+# --paginate requests every page; without --jq the raw JSON arrays are concatenated.
+# Some gh versions emit one array per page; we normalize with python into a single array.
+gh api "repos/OWNER/REPO/issues/N/comments" --paginate --jq '.' > /tmp/issue-N-raw.json 2>/dev/null
+python3 -c "
+import json, sys
+raw = open('/tmp/issue-N-raw.json').read()
+# gh --paginate --jq '.' may emit multiple JSON arrays (one per page) or one combined array.
+# Parse them all and flatten into a single list.
+decoder = json.JSONDecoder()
+idx, comments = 0, []
+raw_stripped = raw.strip()
+while idx < len(raw_stripped):
+    obj, end = decoder.raw_decode(raw_stripped, idx)
+    if isinstance(obj, list):
+        comments.extend(obj)
+    else:
+        comments.append(obj)
+    idx = end
+    while idx < len(raw_stripped) and raw_stripped[idx] in ' \t\n\r':
+        idx += 1
+json.dump(comments, sys.stdout)
+" > /tmp/issue-N-comments.json
+# Step 2: run jq ONCE on the single combined array
+jq '[.[] | .body | capture("relay:attempt attempt=(?<n>[0-9]+)") | .n | tonumber] | max // 0' /tmp/issue-N-comments.json
 ```
 
-For the current-attempt computation, parse each `relay:attempt` record, extract the integer attempt, and take the max. For claim filtering, extract the integer `attempt=` from each claim record and compare numerically (NOT substring regex).
+This produces exactly one scalar regardless of how `--paginate` paginates. The same two-step pattern applies to claim-record filtering: parse the combined array, extract integer `attempt=` from each `relay:claim` record, and compare numerically with the current attempt.
 
 ## Reading the task contract
 

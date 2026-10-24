@@ -94,20 +94,39 @@ When the user asks to review (e.g. "验收一下结果", "review the relay PR"):
 ### On REWORK
 
 - Post numbered, testable change requests on the **existing** PR/Issue (smallest corrective request; no broad redesign by default).
-- **Compute the next attempt via paginated integer parsing** (not substring), **delete the current-attempt lock ref**, post a new attempt marker, and transition the Issue **back to `relay:ready`** so the next "接一轮新任务" resumes that same PR:
+- **Compute the next attempt via paginated global aggregation**, **delete the current-attempt lock ref with explicit error handling**, post a new attempt marker, and transition the Issue **back to `relay:ready`** so the next "接一轮新任务" resumes that same PR:
   ```bash
-  # 1. Fetch ALL comments (paginated), parse attempt as integer, take max
-  CURRENT=$(gh api "repos/OWNER/REPO/issues/N/comments" --paginate --jq '
-    [.[] | .body | capture("relay:attempt attempt=(?<n>[0-9]+)") | .n | tonumber] | max // 0
-  ' 2>/dev/null)
+  # 1. Fetch ALL comments (paginated) into one file, then jq once globally
+  gh api "repos/OWNER/REPO/issues/N/comments" --paginate --jq '.' > /tmp/issue-N-raw.json 2>/dev/null
+  python3 -c "
+  import json
+  raw = open('/tmp/issue-N-raw.json').read().strip()
+  dec = json.JSONDecoder(); idx=0; comments=[]
+  while idx < len(raw):
+    obj, end = dec.raw_decode(raw, idx)
+    comments.extend(obj if isinstance(obj,list) else [obj])
+    idx = end
+    while idx < len(raw) and raw[idx] in ' \t\n\r': idx += 1
+  json.dump(comments, open('/tmp/issue-N-comments.json','w'))
+  "
+  CURRENT=$(jq '[.[] | .body | capture("relay:attempt attempt=(?<n>[0-9]+)") | .n | tonumber] | max // 0' /tmp/issue-N-comments.json)
   NEXT=$((CURRENT + 1))
-  # 2. Delete the current-attempt lock ref (authorizes recovery)
-  gh api -X DELETE "repos/OWNER/REPO/git/refs/relay/issue-N/attempt-$CURRENT" 2>/dev/null || true
+  # 2. Delete the current-attempt lock ref (authorizes recovery). Handle failures explicitly.
+  DEL_RESP=$(gh api -X DELETE "repos/OWNER/REPO/git/refs/relay/issue-N/attempt-$CURRENT" 2>&1)
+  if echo "$DEL_RESP" | grep -qiE '204|No Content|^[[:space:]]*$'; then
+    echo "deleted lock ref attempt-$CURRENT"
+  elif echo "$DEL_RESP" | grep -q '404'; then
+    echo "lock ref attempt-$CURRENT already absent (no claim was made this round); proceeding"
+  else
+    echo "UNEXPECTED delete response: $DEL_RESP" >&2
+    echo "aborting rework transition; investigate before proceeding" >&2
+    exit 1
+  fi
   # 3. Post the new attempt marker and transition
   gh issue comment N -R OWNER/REPO --body "<!-- relay:attempt attempt=$NEXT -->"
   gh issue edit N -R OWNER/REPO --remove-label "relay:review" --add-label "relay:ready"
   ```
-  The attempt marker scopes the next round of worker claims to this attempt only, and the deleted lock ref allows a new worker to claim. Integer parsing avoids the `attempt=1` vs `attempt=10` substring bug.
+  The attempt marker scopes the next round of worker claims to this attempt only, and the deleted lock ref allows a new worker to claim. Integer parsing avoids the `attempt=1` vs `attempt=10` substring bug. The ref deletion is justified for handover: a new attempt has its own unique lock ref (`attempt-K+1`), so deleting the old ref is not for collision avoidance — it is to signal that the old attempt's claim is released and to allow the audit object to be cleaned up. If you need to preserve the old ref as a persistent audit object, skip deletion and instead post a `relay:released` comment on the old attempt; the new attempt's ref name is distinct regardless.
 - Do not create a separate ready Issue for the rework — that would fork the queue. Create a separate ready Issue only for genuinely new work.
 - Do not silently merge, delete, force-push, approve irreversible infrastructure changes, or disclose private datasets. Only merge if authorized by the user and repository policies.
 
