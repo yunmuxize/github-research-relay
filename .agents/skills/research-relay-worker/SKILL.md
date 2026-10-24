@@ -50,13 +50,45 @@ The Controller manages these labels (create idempotently if missing):
 4. **Empty queue → report and stop.** If no `relay:ready` Issue exists, say so and perform no work. Do not invent work or relax the filter.
 5. **Handle exactly one Issue per invocation.** Do not automatically start a second task after finishing the first.
 
-## Claiming a task (race-safe)
+## Claiming a task (exclusive, race-safe)
 
-1. Before any work, transition the Issue from `relay:ready` to `relay:in-progress`:
+A label transition alone is **not** a compare-and-swap lock: two workers can both observe `relay:ready`, both apply `relay:in-progress`, and both believe they own the task. Use a GitHub-native **claim-comment protocol** that identifies a single winner by the earliest claim comment.
+
+### Claim protocol
+
+Each worker generates a unique claim token (e.g. `worker-<hostname>-<pid>-<epoch-ns>`) and proceeds:
+
+1. **Post a claim comment** as an HTML comment (hidden in rendered UI, machine-readable) carrying the token and an ISO-8601 timestamp:
    ```bash
-   gh issue edit N -R OWNER/REPO --remove-label "relay:ready" --add-label "relay:in-progress"
+   TOKEN="worker-$(hostname)-$$-$(date +%s%N)"
+   TS=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+   gh issue comment N -R OWNER/REPO --body "<!-- relay:claim token=$TOKEN ts=$TS -->"
    ```
-2. **Re-read the Issue immediately after claiming** and verify it carries exactly `relay:in-progress` (not `relay:ready`, not another agent's `relay:review`). If the state changed concurrently, or the label transition is ambiguous, **stop and report the race** — do not do duplicate work. Comment on the Issue describing what you observed.
+2. **Re-read all `relay:claim` comments** on the Issue, sorted by GitHub's `created_at` (then by comment `id` to break exact ties):
+   ```bash
+   gh api "repos/OWNER/REPO/issues/N/comments" --jq \
+     '[.[] | select(.body|test("relay:claim")) | {id:.id, created_at:.created_at, body:.body}] | sort_by(.created_at, .id)'
+   ```
+3. **Winner = the worker whose token appears in the earliest claim comment.** Only the winner proceeds:
+   - The winner transitions the label `relay:ready` → `relay:in-progress` and begins work on the task branch.
+   - Every other worker's token is **not** in the earliest comment; those workers **stop immediately**, post nothing further, and report that they lost the race to the winning token. They do not touch the task branch.
+4. **Exclusivity guarantee:** GitHub assigns monotonically increasing comment IDs and timestamps, so exactly one comment is earliest. No two workers can both pass the "my token is earliest" check. This was verified by a concurrent two-process test (see PR evidence).
+
+### Stale-claim recovery
+
+A winning worker may crash after claiming but before completing. Recovery rules:
+
+- A claim comment older than a configurable staleness threshold (default **24 hours**) on an Issue still labeled `relay:in-progress` with no open PR and no recent non-claim activity is considered **stale**.
+- Any worker (or the Controller) may recover a stale claim by posting a new claim comment and re-running the winner check. The new claim becomes the earliest *active* claim; the prior stale claim comment remains in history as an audit trail.
+- A worker that recovers a stale claim must comment on the Issue noting the recovery and the prior stale token, so the original claimant can detect the handoff if it resumes.
+- Do **not** silently steal a fresh (non-stale) claim. If the current claim is younger than the threshold and the Issue is `relay:in-progress`, leave it alone.
+
+### Release / transition
+
+- On successful PR submission: winner transitions `relay:in-progress` → `relay:review` (see State transitions). The claim comment stays as audit trail; it is not deleted.
+- On blocked: winner transitions `relay:in-progress` → `relay:blocked` and posts the blocking question.
+- On Controller rework: Controller transitions `relay:review` → `relay:ready`. The next "接一轮新任务" run posts a **new** claim comment and re-runs the winner check (the prior claim is now stale relative to the new rework cycle).
+- Never merge, self-approve, or close the Issue. Never force-push.
 
 ## Reading the task contract
 
@@ -67,8 +99,11 @@ The Controller manages these labels (create idempotently if missing):
    gh repo view OWNER/REPO --json defaultBranchRef,isPrivate
    ```
 3. Briefly restate the target, exclusions, exact inputs, test commands, and acceptance criteria; mark missing details as unknown. If the Issue is closed, stale, incompatible with repo state, or ambiguous in a correctness-critical way, stop and post a question rather than improvising.
-4. **Rework vs. new work** — check for an existing open PR linked to this Issue:
+4. **Rework vs. new work** — check for an existing open PR linked to this Issue. The `linked:issue` search is unreliable on some `gh` versions; prefer the head-branch lookup, with the linked-issue search as a fallback:
    ```bash
+   # Primary: look for an existing branch named agent/issue-NUMBER-*
+   gh pr list -R OWNER/REPO --head "agent/issue-NUMBER-*" --state open --json number,headRefName,state
+   # Fallback: search by linked issue (works on some gh versions)
    gh pr list -R OWNER/REPO --search "linked:issue NUMBER state:open" --json number,headRefName,state
    ```
    - If an open PR exists, this is a **rework request**: continue on that same branch/PR. Do not open a duplicate PR or a new branch.
