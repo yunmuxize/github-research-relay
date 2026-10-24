@@ -1,0 +1,24 @@
+{
+  "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
+  "name": "research-relay-controller",
+  "version": "0.1.0",
+  "description": "Plan, assign, review and iterate research tasks through GitHub Issues and Pull Requests across multiple coding agents.",
+  "author": {"name": "Research Relay"},
+  "extensions": {
+    "com.openai": {
+      "interface": {
+        "displayName": "Research Relay Controller",
+        "shortDescription": "GitHub research task relay",
+        "longDescription": "Coordinate research through GitHub task issues, experiment pull requests, evidence-based acceptance and next-step decisions. Use the existing authorized GitHub connector when available.",
+        "developerName": "Research Relay",
+        "category": "Productivity",
+        "capabilities": ["Interactive"],
+        "defaultPrompt": [
+          "Use Research Relay to create an evidence-based research task Issue in my GitHub repository.",
+          "Review this GitHub experiment PR against its task Issue and either accept it or write actionable rework feedback.",
+          "Summarize the current research stage from GitHub Issues and PRs, then propose the next smallest testable task."
+        ]
+      }
+    }
+  }
+}

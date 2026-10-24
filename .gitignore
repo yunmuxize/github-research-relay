@@ -1,0 +1,26 @@
+# OS / editor noise
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+*~
+.vscode/
+.idea/
+
+# Local secrets / env — must never be committed
+.env
+.env.*
+*.pem
+*.key
+secrets/
+
+# Local agent scratch (reports are committed; scratch is not)
+.scratch/
+*.log
+
+# Build artifacts
+node_modules/
+dist/
+build/
+__pycache__/
+*.pyc
