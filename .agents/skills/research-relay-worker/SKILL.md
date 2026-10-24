@@ -50,8 +50,21 @@ gh issue comment N -R OWNER/REPO --body "<!-- relay:attempt attempt=$ATTEMPT -->
 ```
 
 - Attempt 1 = initial task. Each Controller rework increments the attempt by 1.
-- If no attempt marker exists (e.g. a pre-existing ready Issue from before this protocol), the Worker treats the Issue creation as attempt 1 and posts the marker itself before claiming.
-- The **current attempt** for an Issue = the highest `attempt=` value among all `relay:attempt` comments. Workers only compete within the current attempt.
+- If no attempt marker exists (e.g. a pre-existing ready Issue from before this protocol), the Worker must **audit the Issue comment history first**: if comments suggest prior rework rounds, transition the Issue to `relay:blocked` and ask the Controller to post the correct attempt marker. Only if history is clearly empty (no prior claims/reviews) may the Worker post `<!-- relay:attempt attempt=1 -->` and proceed.
+- The **current attempt** for an Issue = the maximum integer `attempt=` value among all `relay:attempt` comments, parsed as an integer (NOT substring match — see parsing rule below). Workers only compete within the current attempt.
+
+### Strict integer parsing (not substring regex)
+
+When extracting `attempt=N` from comments, parse the integer structurally and compare numerically. A substring regex `test("attempt=1")` would also match `attempt=10` and `attempt=100`. Instead:
+
+```bash
+# Fetch ALL comments (paginated), then parse attempt as integer
+gh api "repos/OWNER/REPO/issues/N/comments" --paginate --jq '
+  [.[] | .body | capture("relay:attempt attempt=(?<n>[0-9]+)") | .n | tonumber] | max // 0
+'
+```
+
+`capture("relay:attempt attempt=(?<n>[0-9]+)")` extracts only the contiguous digits after `attempt=`, and `tonumber` makes the comparison numeric. This correctly distinguishes attempt 1 from attempt 10 from attempt 100. The same strict parsing applies to `relay:claim` records: extract the integer attempt and compare numerically with the current attempt.
 
 ## Task selection
 
@@ -66,52 +79,81 @@ gh issue comment N -R OWNER/REPO --body "<!-- relay:attempt attempt=$ATTEMPT -->
 5. **Handle exactly one Issue per invocation.** Do not automatically start a second task after finishing the first.
 6. **Queue bound:** if more than 200 Issues are labeled `relay:ready`, the Controller should not create excess ready tasks; the Worker fetches up to 200 and sorts client-side. This is a documented bounded-queue contract, not an unbounded FIFO claim.
 
-## Claiming a task (exclusive, epoch-scoped)
+## Claiming a task (atomic, epoch-scoped)
 
-A label transition alone is **not** a compare-and-swap lock: two workers can both observe `relay:ready`, both apply `relay:in-progress`, and both believe they own the task. Use a GitHub-native **claim-comment protocol** that identifies a single winner by the earliest claim comment **within the current attempt**.
+A label transition alone is **not** a compare-and-swap lock: two workers can both observe `relay:ready`, both apply `relay:in-progress`, and both believe they own the task. GitHub Issue comments are an append-only audit log but **not** an atomic compare-and-set. The exclusive-claim primitive here is **GitHub ref creation**, which is atomic: `POST /repos/OWNER/REPO/git/refs` with a unique ref name succeeds for exactly one creator; all concurrent creators of the same ref get `422 Reference already exists`. Claim comments remain as an audit trail, but the ref is the lock.
 
 ### Claim protocol
 
-1. **Determine the current attempt** for the Issue (see Attempt markers). If no `relay:attempt` marker exists, post `<!-- relay:attempt attempt=1 -->` and use attempt 1.
-2. **Post a claim comment** as an HTML comment carrying the token, the attempt number, and an ISO-8601 timestamp:
+1. **Determine the current attempt** for the Issue (see Attempt markers). If no `relay:attempt` marker exists and the Issue is a legacy ready Issue, the Worker posts `<!-- relay:attempt attempt=1 -->` and uses attempt 1 — but it must **not** silently initialize a prior rework cycle as attempt 1 without auditing comment history; if comments suggest prior rounds, transition the Issue to `relay:blocked` and ask the Controller to post the correct attempt marker instead.
+2. **Generate a random opaque claim token** (do NOT use hostnames or PII — use a random hex string):
    ```bash
-   TOKEN="worker-$(hostname)-$$-$(date +%s%N)"
-   TS=$(date -u +%Y-%m-%dT%H:%M:%SZ)
-   ATTEMPT=<current attempt number>
-   gh issue comment N -R OWNER/REPO --body "<!-- relay:claim token=$TOKEN attempt=$ATTEMPT ts=$TS -->"
+   TOKEN=$(head -c 16 /dev/urandom | xxd -p)
    ```
-3. **Re-read all `relay:claim` comments for the current attempt only**, sorted by GitHub's `created_at` (then by comment `id` to break exact ties):
+3. **Atomically create the claim ref.** The ref name encodes issue + attempt + token:
    ```bash
-   gh api "repos/OWNER/REPO/issues/N/comments" --jq \
-     "[.[] | select(.body|test(\"relay:claim\")) | select(.body|test(\"attempt=$ATTEMPT\")) | {id:.id, created_at:.created_at, body:.body}] | sort_by(.created_at, .id)"
+   REF="refs/relay/issue-N/attempt-K/claim-$TOKEN"   # N=issue number, K=current attempt
+   BASE_SHA=$(gh api repos/OWNER/REPO/git/refs/heads/main --jq '.object.sha')
+   PAYLOAD=$(printf '{"ref":"%s","sha":"%s"}' "$REF" "$BASE_SHA")
+   echo "$PAYLOAD" | gh api -X POST repos/OWNER/REPO/git/refs --input - 2>&1
    ```
-   **Only claims with `attempt=<current>` are considered.** Prior-attempt claims are invisible to this round — this is what makes rework work (see below).
-4. **Winner = the worker whose token appears in the earliest claim comment for the current attempt.** Only the winner proceeds:
-   - The winner transitions the label `relay:ready` → `relay:in-progress` and begins work on the task branch.
-   - Every other worker's token is **not** in the earliest comment for this attempt; those workers **stop immediately**, post nothing further, and report that they lost the race to the winning token. They do not touch the task branch.
-5. **Exclusivity guarantee:** GitHub assigns monotonically increasing comment IDs and timestamps, so exactly one comment is earliest within an attempt. No two workers can both pass the "my token is earliest (in this attempt)" check. Prior-attempt claims do not compete because they are filtered out by `attempt=`.
+   - If the response is `201 Created`: **you are the exclusive winner** of this (issue, attempt). Exactly one worker can reach this state per (issue, attempt) — the ref namespace `refs/relay/issue-N/attempt-K/` is the lock.
+   - If the response is `422 Reference already exists`: **another worker already claimed this (issue, attempt)**. Stop immediately; do not touch the task branch, do not post a claim comment. Report that you lost the race.
+4. **Post a claim-comment audit record** (only the winner does this, after the ref is created):
+   ```bash
+   gh issue comment N -R OWNER/REPO --body "<!-- relay:claim token=$TOKEN attempt=$K ref=$REF ts=$(date -u +%Y-%m-%dT%H:%M:%SZ) -->"
+   ```
+5. **Winner transitions the label** `relay:ready` → `relay:in-progress` and begins work on the task branch.
+6. **Exclusivity guarantee:** GitHub ref creation is an atomic compare-and-set at the ref namespace. Two workers racing to create `refs/relay/issue-N/attempt-K/claim-<tokenA>` and `...claim-<tokenB>` create *different* refs (different token suffix) — but the winner check is: scan `refs/relay/issue-N/attempt-K/*` and the single existing ref identifies the winner. To make this a single-winner lock, the winner is the worker whose ref exists after the race; losers detect they are not the winner by listing the namespace. Equivalently, a simpler single-ref lock uses a fixed ref name per (issue, attempt) and the token goes only in the comment:
+   ```bash
+   # Preferred single-ref lock: exactly one creator wins
+   LOCK_REF="refs/relay/issue-N/attempt-K"   # fixed name per (issue, attempt)
+   echo "{\"ref\":\"$LOCK_REF\",\"sha\":\"$BASE_SHA\"}" | gh api -X POST repos/OWNER/REPO/git/refs --input -
+   ```
+   - `201 Created` → you are the sole winner. Record your token in a claim comment.
+   - `422 Reference already exists` → you lost. Stop.
+   This is a true atomic lock: the ref name is fixed per (issue, attempt), so exactly one `POST` succeeds.
 
-### Why this fixes the rework problem
+### Determining the winner / verifying ownership
 
-Without attempt-scoping, the earliest claim comment across **all** history would permanently win every round. With attempt markers:
-- Round 1 (attempt 1): Workers A and B post claims with `attempt=1`. A wins (earliest), completes a PR, transitions to `relay:review`.
-- Controller rework: transitions `relay:review` → `relay:ready` and posts `<!-- relay:attempt attempt=2 -->`.
-- Round 2 (attempt 2): Worker C posts a claim with `attempt=2`. The winner check filters to `attempt=2` only, so C's claim is the earliest (and only) claim in this attempt — C wins. Round 1's claims (attempt=1) are irrelevant. This was the failure mode in the prior PR version; it is now fixed.
+A worker that needs to verify who owns the current attempt lists the lock ref:
+
+```bash
+gh api "repos/OWNER/REPO/git/refs/relay/issue-N/attempt-K" --jq '.ref, .object.sha' 2>&1
+# 404 -> no one has claimed this attempt yet
+# 200 -> the ref exists; the winner is the worker whose token is in the earliest relay:claim comment with attempt=K
+```
+
+Before any branch write, a worker re-verifies the lock ref still exists and points at the expected commit lineage. If the lock ref has been deleted (see Release below) the claim is no longer valid.
 
 ### Stale / crashed claims — manual recovery only
 
-A winning worker may crash after claiming but before completing. **Automatic time-based recovery is not safe** — elapsed time alone does not prove the original process has stopped, and the original worker could resume and push to the branch after a takeover. Therefore:
+A winning worker may crash after creating the lock ref but before completing. **Automatic time-based recovery is not safe** — elapsed time alone does not prove the original process has stopped, and the original worker could resume and push to the branch after a takeover. Therefore:
 
-- **Do not auto-recover a stale claim.** If a worker observes an `relay:in-progress` Issue whose winning claim is old and no open PR exists, it may **report** this to the Controller (post a comment noting the potentially stale claim and its age) but must **not** take over the task.
-- **Recovery requires Controller authorization:** the Controller reviews the situation, transitions the Issue to `relay:blocked` (if the original worker should be contacted) or posts a new `relay:attempt` marker and transitions back to `relay:ready` (if the original worker is confirmed gone). Only then does a new worker claim within the new attempt.
+- **Do not auto-recover a stale claim.** A worker that observes an `relay:in-progress` Issue with a lock ref but no open PR may **report** the potentially stale claim to the Controller (post a comment noting the lock ref and its age) but must **not** delete the lock ref or take over the task.
+- **Recovery requires Controller authorization:** the Controller reviews, deletes the stale lock ref (`DELETE /repos/OWNER/REPO/git/refs/relay/issue-N/attempt-K`), posts a new `relay:attempt` marker (incremented), and transitions back to `relay:ready`. Only then does a new worker claim within the new attempt.
 - This is an explicit limitation: **concurrent recovery from a crashed claim is not supported without Controller authorization.** The design prioritizes safety over automatic healing.
 
 ### Release / transition
 
-- On successful PR submission: winner transitions `relay:in-progress` → `relay:review` (see State transitions). The claim comment stays as audit trail; it is not deleted.
-- On blocked: winner transitions `relay:in-progress` → `relay:blocked` and posts the blocking question.
-- On Controller rework: Controller transitions `relay:review` → `relay:ready` and posts a new `relay:attempt` marker (incremented). The next "接一轮新任务" run posts a claim with the new attempt number and competes only within that attempt.
+- On successful PR submission: winner transitions `relay:in-progress` → `relay:review` (see State transitions). The lock ref and claim comment stay as audit trail; the lock ref is **not** deleted (it proves who claimed this attempt).
+- On blocked: winner transitions `relay:in-progress` → `relay:blocked` and posts the blocking question. Lock ref stays.
+- On Controller rework: Controller deletes the current-attempt lock ref (`DELETE .../refs/relay/issue-N/attempt-K`), posts a new `relay:attempt` marker (incremented), and transitions `relay:review` → `relay:ready`. The next claim creates `refs/relay/issue-N/attempt-(K+1)`.
 - Never merge, self-approve, or close the Issue. Never force-push.
+
+### Reading all comments (pagination)
+
+Issue comments are paginated (GitHub default 30/page). All reads of `relay:attempt` markers and `relay:claim` audit records MUST fetch all pages in a single global reduction, not page-by-page:
+
+```bash
+# Fetch ALL comments, then reduce in one pass
+gh api "repos/OWNER/REPO/issues/N/comments" --paginate --jq \
+  '[.[] | {id:.id, created_at:.created_at, body:.body}]' \
+  > /tmp/issue-N-comments.json
+# Then parse attempt markers and claim records from the full file
+```
+
+For the current-attempt computation, parse each `relay:attempt` record, extract the integer attempt, and take the max. For claim filtering, extract the integer `attempt=` from each claim record and compare numerically (NOT substring regex).
 
 ## Reading the task contract
 

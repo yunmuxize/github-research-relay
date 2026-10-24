@@ -94,15 +94,20 @@ When the user asks to review (e.g. "验收一下结果", "review the relay PR"):
 ### On REWORK
 
 - Post numbered, testable change requests on the **existing** PR/Issue (smallest corrective request; no broad redesign by default).
-- **Post an attempt-marker comment** to start the next claim epoch, then transition the Issue **back to `relay:ready`** so the next "接一轮新任务" resumes that same PR:
+- **Compute the next attempt via paginated integer parsing** (not substring), **delete the current-attempt lock ref**, post a new attempt marker, and transition the Issue **back to `relay:ready`** so the next "接一轮新任务" resumes that same PR:
   ```bash
-  # Determine the next attempt number (highest existing attempt + 1)
-  ATTEMPT=$(gh api "repos/OWNER/REPO/issues/N/comments" --jq '[.[] | select(.body|test("relay:attempt")) | capture("attempt=(?<n>[0-9]+)") | .n | tonumber] | max // 0' 2>/dev/null)
-  ATTEMPT=$((ATTEMPT + 1))
-  gh issue comment N -R OWNER/REPO --body "<!-- relay:attempt attempt=$ATTEMPT -->"
+  # 1. Fetch ALL comments (paginated), parse attempt as integer, take max
+  CURRENT=$(gh api "repos/OWNER/REPO/issues/N/comments" --paginate --jq '
+    [.[] | .body | capture("relay:attempt attempt=(?<n>[0-9]+)") | .n | tonumber] | max // 0
+  ' 2>/dev/null)
+  NEXT=$((CURRENT + 1))
+  # 2. Delete the current-attempt lock ref (authorizes recovery)
+  gh api -X DELETE "repos/OWNER/REPO/git/refs/relay/issue-N/attempt-$CURRENT" 2>/dev/null || true
+  # 3. Post the new attempt marker and transition
+  gh issue comment N -R OWNER/REPO --body "<!-- relay:attempt attempt=$NEXT -->"
   gh issue edit N -R OWNER/REPO --remove-label "relay:review" --add-label "relay:ready"
   ```
-  The attempt marker scopes the next round of worker claims to this attempt only, so prior-round claims do not permanently block new workers.
+  The attempt marker scopes the next round of worker claims to this attempt only, and the deleted lock ref allows a new worker to claim. Integer parsing avoids the `attempt=1` vs `attempt=10` substring bug.
 - Do not create a separate ready Issue for the rework — that would fork the queue. Create a separate ready Issue only for genuinely new work.
 - Do not silently merge, delete, force-push, approve irreversible infrastructure changes, or disclose private datasets. Only merge if authorized by the user and repository policies.
 
