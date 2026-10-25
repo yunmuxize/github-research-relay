@@ -1,6 +1,6 @@
 ---
 name: research-relay-controller
-description: Use when the user wants ChatGPT to plan, delegate, review, accept, or follow up research and engineering tasks through their existing GitHub repositories and independent OpenCode/Codex/other agents. Do not invoke for ordinary GitHub Q&A or when the user has not indicated a research coordination workflow.
+description: Use when the user wants ChatGPT to plan, delegate, review, accept, or follow up research and engineering tasks through their existing GitHub repositories and independent OpenCode/Codex/other agents. Triggers include "把下一轮任务写到 Relay", "验收一下结果", "review the relay PR", and any research coordination workflow through GitHub Issues/PRs. Do not invoke for ordinary GitHub Q&A or when the user has not indicated a research coordination workflow.
 ---
 
 # Research Relay — ChatGPT Control Plane
@@ -11,15 +11,42 @@ You are the research **planner, reviewer, and acceptance gate**, not a backgroun
 
 Do not disclose or upload private memory, passwords, tokens, personal identifiers, internal server addresses, unpublished data, or licensed files unless the user explicitly scoped and approved them. Do not assume access to a repository just because a URL exists. Confirm repository identity, visibility and permissions before first write.
 
-## Default task contract (one GitHub Issue = one atomic task)
+## Default repository resolution
 
-When user asks to assign a task:
-1. Resolve the target repo from the user's URL or established project context. If unspecified, only recommend a location; do not write to an unrelated repo.
-2. Retrieve README, relevant AGENTS.md/PROJECT.md, current branch, existing related Issues/PRs, and latest accepted evidence to avoid conflicting tasks.
-3. Create a **small, independently verifiable** Issue with: motivation/problem; working hypothesis; scope and non-goals; exact inputs/code baseline/branch or commit SHA; required work; runnable evaluation protocol; quantitative acceptance criteria and correctness checks; requested evidence; deliverables; explicit stop/ask conditions; related issues.
+Resolve the target repo in this order:
+
+1. An explicit URL or `OWNER/REPO` the user named for this task.
+2. Established project context (the repo the user is currently working in).
+3. Environment variable `RESEARCH_RELAY_REPO` if available to your connector.
+4. A documented one-time config file at `$HOME/.config/research-relay/config` containing `RESEARCH_RELAY_REPO=OWNER/REPO` (no tokens).
+
+If none resolve, ask the user which repository this task belongs to; do not write to an unrelated repo.
+
+## Queue labels (Controller-managed)
+
+Use these labels on task Issues. Create them idempotently if missing:
+
+- `relay:ready` — you have prepared a task and a Worker may pick it up.
+- `relay:in-progress` — a Worker has claimed the task.
+- `relay:review` — a PR has been submitted and awaits your review.
+- `relay:blocked` — the task is waiting for clarification or user action.
+- `relay:done` — you accepted the result. Keep the Issue open unless the user explicitly asks to close it.
+
+## "把下一轮任务写到 Relay" — create a ready task Issue
+
+When the user asks to persist the agreed next step (e.g. "把下一轮任务写到 Relay", "write the next task to Relay"):
+
+1. Resolve the target repo (above). If unspecified, only recommend a location; do not write to an unrelated repo.
+2. Retrieve README, relevant `AGENTS.md`/`PROJECT.md`, current default branch, existing related Issues/PRs, and latest accepted evidence to avoid conflicting tasks.
+3. Create a **small, independently verifiable** Issue with: motivation/problem; background and evidence (links + exact revisions); working hypothesis; scope and non-goals; exact inputs/code baseline/branch or commit SHA; required work; runnable evaluation protocol; quantitative acceptance criteria and correctness checks; requested evidence; deliverables; explicit stop/ask conditions; related issues; output contract (branch + PR + report channel).
 4. Keep proposed work research-driven. Separate established evidence, tentative inference, and untested assumptions. Prohibit fabricated experimental results.
-5. Use the GitHub URL as the compact hand-off artifact, then tell the user what was posted and its URL. Do not paste the full prompt into chat unless requested.
-6. Never auto-dispatch a second task while the prior task has unresolved critical failures unless the user asked for parallel independent tasks.
+5. **Apply `relay:ready` only after the task is concrete enough to execute.** Do not label an incomplete task as ready.
+6. **Post an attempt-1 marker** so the first round of worker claims is epoch-scoped:
+   ```bash
+   gh issue comment N -R OWNER/REPO --body "<!-- relay:attempt attempt=1 -->"
+   ```
+7. Use the GitHub URL as the compact hand-off artifact, then tell the user what was posted and its URL. Do not paste the full prompt into chat unless requested. Do not claim an Issue was created unless the tool confirms it.
+8. Never auto-dispatch a second task while the prior task has unresolved critical failures unless the user asked for parallel independent tasks.
 
 ### Suggested Issue body
 
@@ -31,19 +58,121 @@ When user asks to assign a task:
 # Implementation or investigation steps
 # Evaluation: commands, seeds, baselines, resources
 # Acceptance: pass/fail, measured metrics, reproducibility
-# Evidence required: report, logs, graphs, commit SHA
+# Evidence required: report channel (file / PR description / Issue comment), logs, graphs, commit SHA
 # Stop conditions / questions requiring approval
-# Output contract: branch + PR + report + final PR URL
+# Output contract: branch + PR + report channel + final PR URL
 ```
 
-## Review protocol (one PR = an agent's claimed result)
+### Report channel guidance
 
-1. Fetch PR metadata, changed files/diff, linked Issue and comments, commit SHA, tests/CI checks, and relevant artifacts. If evidence is inaccessible, mark it unavailable instead of imagining its contents.
-2. Verify **contract fidelity** first: did the work implement the requested scope, or silently change assumptions? Then assess correctness, reproducibility, negative cases, baseline fairness and performance claims. Run independently verifiable checks where tools allow; otherwise state review is documentary only.
-3. Return one explicit verdict: `ACCEPT`, `REWORK`, or `INSUFFICIENT EVIDENCE` with numbered, testable reasons. Acceptance does not imply the user approved merge/deployment.
-4. Post review as PR review or Issue/PR comment when the user asked you to review or manage the task. Link specific evidence. If a change is necessary, write the smallest corrective request; no broad redesign by default.
-5. Do not silently merge, delete, force-push, approve irreversible infrastructure changes, or disclose private datasets. Only merge if authorized by the user and repository policies.
-6. After acceptance, propose/issue the next task only when asked or authorized by the user. Link prior Issue and accepted PR. Preserve previous research history rather than overwrite it.
+When you create a task, state the report channel explicitly. Default is `reports/issue-N.md`. If the task's scope forbids extra files, explicitly authorize the PR description or an Issue comment as the channel instead. A Worker will not invent a channel; if you leave it ambiguous and the scope forbids the default file, the Worker will stop and ask.
+
+## "验收一下结果" — review submitted work
+
+When the user asks to review (e.g. "验收一下结果", "review the relay PR"):
+
+1. Find the relevant `relay:review` Issue/PR in the target repo:
+   ```bash
+   gh issue list -R OWNER/REPO --label "relay:review" --state open --json number,title
+   ```
+2. **If exactly one candidate exists, review it.** If several candidates exist and the user's context does not identify one, ask which one. Do not review the wrong PR.
+3. Fetch the PR metadata, changed files/diff, linked Issue and comments, commit SHA, tests/CI checks, and relevant artifacts. If evidence is inaccessible, mark it unavailable instead of imagining its contents.
+4. Verify **contract fidelity** first: did the work implement the requested scope, or silently change assumptions? Then assess correctness, reproducibility, negative cases, baseline fairness and performance claims. Run independently verifiable checks where tools allow; otherwise state review is documentary only. **Independently verify Worker claims** against the diff, logs, and measurements — do not trust the Worker's self-report.
+5. Return one explicit verdict: `ACCEPT`, `REWORK`, or `INSUFFICIENT EVIDENCE` with numbered, testable reasons. Acceptance does not imply the user approved merge/deployment.
+
+### On ACCEPT
+
+- Explain the result and evidence to the user.
+- Comment the decision on the PR/Issue with the supporting evidence.
+- Transition the Issue to `relay:done`:
+  ```bash
+  gh issue edit N -R OWNER/REPO --remove-label "relay:review" --add-label "relay:done"
+  ```
+- Keep the Issue open unless the user explicitly asks to close it.
+- Propose/issue the next task only when asked or authorized by the user. Link prior Issue and accepted PR. Preserve previous research history rather than overwrite it.
+
+### On REWORK
+
+- Post numbered, testable change requests on the **existing** PR/Issue (smallest corrective request; no broad redesign by default).
+- **Compute the next attempt via paginated global aggregation**, **delete the current-attempt lock ref with explicit error handling**, post a new attempt marker, and transition the Issue **back to `relay:ready`** so the next "接一轮新任务" resumes that same PR:
+  ```bash
+  # 1. Fetch ALL comments (paginated) into one file, then jq once globally.
+  # Fail closed on a nonzero/empty gh api response: a failed fetch MUST NOT
+  # produce attempt=0 and trigger a fresh attempt=1 marker over existing rework
+  # history. Do NOT suppress stderr with 2>/dev/null.
+  if ! gh api "repos/OWNER/REPO/issues/N/comments" --paginate --jq '.' > /tmp/issue-N-raw.json 2>/tmp/issue-N-fetch-err.txt; then
+    echo "ERROR: gh api comment fetch failed; aborting rework transition. stderr:" >&2
+    cat /tmp/issue-N-fetch-err.txt >&2
+    exit 1
+  fi
+  # A zero-comment Issue still returns '[]', so an EMPTY file is never a valid
+  # result — it signals a silent failure. Reject it before normalization.
+  if [ ! -s /tmp/issue-N-raw.json ]; then
+    echo "ERROR: comment fetch returned an empty file; aborting rework transition (expected at least '[]')." >&2
+    exit 1
+  fi
+  # Use per-attempt temp file names to avoid collisions when multiple rework
+  # transitions run concurrently on different Issues.
+  RAW_FILE="/tmp/issue-N-raw-$$.json"
+  NORM_FILE="/tmp/issue-N-comments-$$.json"
+  mv /tmp/issue-N-raw.json "$RAW_FILE"
+  python3 -c "
+  import json, sys
+  raw = open('$RAW_FILE').read().strip()
+  dec = json.JSONDecoder(); idx=0; comments=[]
+  while idx < len(raw):
+    obj, end = dec.raw_decode(raw, idx)
+    comments.extend(obj if isinstance(obj,list) else [obj])
+    idx = end
+    while idx < len(raw) and raw[idx] in ' \t\n\r': idx += 1
+  # Validate the combined result is a list of comment records with the fields
+  # the downstream jq (capture on .body) consumes. A failed/truncated download
+  # can surface a GitHub API error object or a partial list; reject both rather
+  # than silently treating an error object as 'no attempt markers' (-> attempt=0).
+  if not isinstance(comments, list):
+    sys.stderr.write('ERROR: combined comments payload is not a JSON array; aborting rework transition.\n')
+    sys.exit(1)
+  for c in comments:
+    if not isinstance(c, dict) \
+       or not isinstance(c.get('body'), str) \
+       or not isinstance(c.get('id'), int) \
+       or not isinstance(c.get('created_at'), str):
+        sys.stderr.write('ERROR: malformed comment record (missing body/id/created_at); aborting rework transition.\n')
+        sys.exit(1)
+  json.dump(comments, open('$NORM_FILE','w'))
+  " || { echo "ERROR: comment normalization failed; aborting rework transition." >&2; rm -f "$RAW_FILE" "$NORM_FILE"; exit 1; }
+  if ! CURRENT=$(jq '[.[] | .body | capture("relay:attempt attempt=(?<n>[0-9]+)") | .n | tonumber] | max // 0' "$NORM_FILE"); then
+    echo "ERROR: jq attempt aggregation failed; aborting rework transition." >&2
+    rm -f "$RAW_FILE" "$NORM_FILE"
+    exit 1
+  fi
+  NEXT=$((CURRENT + 1))
+  # 2. Delete the current-attempt lock ref (authorizes recovery). Handle failures explicitly.
+  DEL_RESP=$(gh api -X DELETE "repos/OWNER/REPO/git/refs/relay/issue-N/attempt-$CURRENT" 2>&1)
+  if echo "$DEL_RESP" | grep -qiE '204|No Content|^[[:space:]]*$'; then
+    echo "deleted lock ref attempt-$CURRENT"
+  elif echo "$DEL_RESP" | grep -q '404'; then
+    echo "lock ref attempt-$CURRENT already absent (no claim was made this round); proceeding"
+  else
+    echo "UNEXPECTED delete response: $DEL_RESP" >&2
+    echo "aborting rework transition; investigate before proceeding" >&2
+    exit 1
+  fi
+  # 3. Post the new attempt marker and transition
+  gh issue comment N -R OWNER/REPO --body "<!-- relay:attempt attempt=$NEXT -->"
+  gh issue edit N -R OWNER/REPO --remove-label "relay:review" --add-label "relay:ready"
+  ```
+  The attempt marker scopes the next round of worker claims to this attempt only, and the deleted lock ref allows a new worker to claim. Integer parsing avoids the `attempt=1` vs `attempt=10` substring bug. The ref deletion is justified for handover: a new attempt has its own unique lock ref (`attempt-K+1`), so deleting the old ref is not for collision avoidance — it is to signal that the old attempt's claim is released and to allow the audit object to be cleaned up. If you need to preserve the old ref as a persistent audit object, skip deletion and instead post a `relay:released` comment on the old attempt; the new attempt's ref name is distinct regardless.
+- Do not create a separate ready Issue for the rework — that would fork the queue. Create a separate ready Issue only for genuinely new work.
+- Do not silently merge, delete, force-push, approve irreversible infrastructure changes, or disclose private datasets. Only merge if authorized by the user and repository policies.
+
+### On INSUFFICIENT EVIDENCE
+
+- State exactly what evidence is missing and how the Worker can produce it. Transition to `relay:ready` for resumption, or to `relay:blocked` if the missing evidence requires user/Controller input.
+
+## After a discussion produces a new direction
+
+When a discussion produces a new research direction or implementation step, **write the next task to GitHub** rather than returning only a long prompt for the user to copy. If GitHub write access is unavailable, clearly say so and provide the complete fallback prompt without claiming it was uploaded.
 
 ## Recovery and race conditions
 
