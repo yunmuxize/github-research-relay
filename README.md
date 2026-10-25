@@ -1,5 +1,12 @@
 # GitHub Research Relay
 
+> **Relay · 一句话科研协作**：中文快速入口 [docs/ONE_LINE_WORKFLOW.md](docs/ONE_LINE_WORKFLOW.md) ｜ 新私有科研项目 [templates/PROJECT_BOOTSTRAP.md](templates/PROJECT_BOOTSTRAP.md)。这个公共仓库是 **Skills / ChatGPT 插件规范库**，不存放未发表科研材料。
+>
+> ChatGPT：**“用 Research Relay，把刚才讨论的下一步交给 OpenCode。”** → 创建私有项目仓库中的 Issue，并返回一句话指令。
+> OpenCode：**“请加载 research-relay-worker，执行 <Issue URL>，提交 PR 待验收。”**
+> 回到 ChatGPT：**“验收一下结果。”** → 独立审查并在 GitHub 记录 ACCEPT / REWORK。
+
+
 **GitHub Issues + Pull Requests as a durable message bus between research planning agents (ChatGPT) and execution agents (OpenCode / Codex / others).**
 
 This is a generic, reusable, open-source framework — not a personal research data store. Any account on any server can fork it and run the same loop.
