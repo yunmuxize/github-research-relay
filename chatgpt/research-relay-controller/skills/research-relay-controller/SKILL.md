@@ -96,20 +96,56 @@ When the user asks to review (e.g. "验收一下结果", "review the relay PR"):
 - Post numbered, testable change requests on the **existing** PR/Issue (smallest corrective request; no broad redesign by default).
 - **Compute the next attempt via paginated global aggregation**, **delete the current-attempt lock ref with explicit error handling**, post a new attempt marker, and transition the Issue **back to `relay:ready`** so the next "接一轮新任务" resumes that same PR:
   ```bash
-  # 1. Fetch ALL comments (paginated) into one file, then jq once globally
-  gh api "repos/OWNER/REPO/issues/N/comments" --paginate --jq '.' > /tmp/issue-N-raw.json 2>/dev/null
+  # 1. Fetch ALL comments (paginated) into one file, then jq once globally.
+  # Fail closed on a nonzero/empty gh api response: a failed fetch MUST NOT
+  # produce attempt=0 and trigger a fresh attempt=1 marker over existing rework
+  # history. Do NOT suppress stderr with 2>/dev/null.
+  if ! gh api "repos/OWNER/REPO/issues/N/comments" --paginate --jq '.' > /tmp/issue-N-raw.json 2>/tmp/issue-N-fetch-err.txt; then
+    echo "ERROR: gh api comment fetch failed; aborting rework transition. stderr:" >&2
+    cat /tmp/issue-N-fetch-err.txt >&2
+    exit 1
+  fi
+  # A zero-comment Issue still returns '[]', so an EMPTY file is never a valid
+  # result — it signals a silent failure. Reject it before normalization.
+  if [ ! -s /tmp/issue-N-raw.json ]; then
+    echo "ERROR: comment fetch returned an empty file; aborting rework transition (expected at least '[]')." >&2
+    exit 1
+  fi
+  # Use per-attempt temp file names to avoid collisions when multiple rework
+  # transitions run concurrently on different Issues.
+  RAW_FILE="/tmp/issue-N-raw-$$.json"
+  NORM_FILE="/tmp/issue-N-comments-$$.json"
+  mv /tmp/issue-N-raw.json "$RAW_FILE"
   python3 -c "
-  import json
-  raw = open('/tmp/issue-N-raw.json').read().strip()
+  import json, sys
+  raw = open('$RAW_FILE').read().strip()
   dec = json.JSONDecoder(); idx=0; comments=[]
   while idx < len(raw):
     obj, end = dec.raw_decode(raw, idx)
     comments.extend(obj if isinstance(obj,list) else [obj])
     idx = end
     while idx < len(raw) and raw[idx] in ' \t\n\r': idx += 1
-  json.dump(comments, open('/tmp/issue-N-comments.json','w'))
-  "
-  CURRENT=$(jq '[.[] | .body | capture("relay:attempt attempt=(?<n>[0-9]+)") | .n | tonumber] | max // 0' /tmp/issue-N-comments.json)
+  # Validate the combined result is a list of comment records with the fields
+  # the downstream jq (capture on .body) consumes. A failed/truncated download
+  # can surface a GitHub API error object or a partial list; reject both rather
+  # than silently treating an error object as 'no attempt markers' (-> attempt=0).
+  if not isinstance(comments, list):
+    sys.stderr.write('ERROR: combined comments payload is not a JSON array; aborting rework transition.\n')
+    sys.exit(1)
+  for c in comments:
+    if not isinstance(c, dict) \
+       or not isinstance(c.get('body'), str) \
+       or not isinstance(c.get('id'), int) \
+       or not isinstance(c.get('created_at'), str):
+        sys.stderr.write('ERROR: malformed comment record (missing body/id/created_at); aborting rework transition.\n')
+        sys.exit(1)
+  json.dump(comments, open('$NORM_FILE','w'))
+  " || { echo "ERROR: comment normalization failed; aborting rework transition." >&2; rm -f "$RAW_FILE" "$NORM_FILE"; exit 1; }
+  if ! CURRENT=$(jq '[.[] | .body | capture("relay:attempt attempt=(?<n>[0-9]+)") | .n | tonumber] | max // 0' "$NORM_FILE"); then
+    echo "ERROR: jq attempt aggregation failed; aborting rework transition." >&2
+    rm -f "$RAW_FILE" "$NORM_FILE"
+    exit 1
+  fi
   NEXT=$((CURRENT + 1))
   # 2. Delete the current-attempt lock ref (authorizes recovery). Handle failures explicitly.
   DEL_RESP=$(gh api -X DELETE "repos/OWNER/REPO/git/refs/relay/issue-N/attempt-$CURRENT" 2>&1)
