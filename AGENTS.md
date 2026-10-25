@@ -1,5 +1,8 @@
 # AGENTS.md — GitHub Research Relay
 
+**Quick entrypoint:** [docs/ONE_LINE_WORKFLOW.md](docs/ONE_LINE_WORKFLOW.md) documents new-project bootstrap, one-line ChatGPT-to-OpenCode task creation, version checks, and the separation between the public skills hub and private research repositories. Read it first when the user asks to start a research project or hand off the next task.
+
+
 This file tells any AI agent working in this repository how to pick a skill, read a task, and report back. It applies to ChatGPT (controller), OpenCode, Codex, and any other Agent-Skills-aware tool.
 
 ## Two skills, two roles
