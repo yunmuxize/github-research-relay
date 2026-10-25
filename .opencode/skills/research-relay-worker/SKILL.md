@@ -93,7 +93,16 @@ A label transition alone is **not** a compare-and-swap lock: two workers can bot
 3. **Atomically create the fixed-name lock ref.** The ref name is fixed per (issue, attempt) — it does NOT contain the token. Exactly one worker can create this ref; all others get 422:
    ```bash
    REF="refs/relay/issue-N/attempt-K"   # N=issue number, K=current attempt; FIXED name
-   BASE_SHA=$(gh api repos/OWNER/REPO/git/refs/heads/main --jq '.object.sha')
+   # Resolve the repo's default branch dynamically (main / master / custom). Do NOT hardcode "main":
+   # this skill targets arbitrary repositories. Fail closed if the default branch cannot be resolved.
+   DEFAULT_BRANCH=$(gh repo view OWNER/REPO --json defaultBranchRef --jq '.defaultBranchRef.name' 2>/tmp/relay-default-branch-err.txt) \
+     || { echo "ERROR: cannot resolve defaultBranchRef for OWNER/REPO; failing closed." >&2; cat /tmp/relay-default-branch-err.txt >&2; exit 1; }
+   [ -n "$DEFAULT_BRANCH" ] \
+     || { echo "ERROR: defaultBranchRef.name is empty for OWNER/REPO; failing closed." >&2; exit 1; }
+   BASE_SHA=$(gh api "repos/OWNER/REPO/git/refs/heads/$DEFAULT_BRANCH" --jq '.object.sha' 2>/tmp/relay-base-sha-err.txt) \
+     || { echo "ERROR: cannot resolve HEAD sha of default branch '$DEFAULT_BRANCH'; failing closed." >&2; cat /tmp/relay-base-sha-err.txt >&2; exit 1; }
+   [ -n "$BASE_SHA" ] \
+     || { echo "ERROR: resolved BASE_SHA is empty; failing closed." >&2; exit 1; }
    PAYLOAD=$(printf '{"ref":"%s","sha":"%s"}' "$REF" "$BASE_SHA")
    RESP=$(echo "$PAYLOAD" | gh api -X POST repos/OWNER/REPO/git/refs --input - 2>&1)
    ```
@@ -142,10 +151,23 @@ Issue comments are paginated (GitHub default 30/page). All reads of `relay:attem
 Use this two-step pattern: fetch all pages to a single file, then run jq once globally:
 
 ```bash
-# Step 1: fetch ALL comment pages into one file.
-# --paginate requests every page; without --jq the raw JSON arrays are concatenated.
+# Step 1: fetch ALL comment pages into one file. Fail closed on download error.
+# --paginate requests every page; --jq '.' emits raw JSON arrays.
 # Some gh versions emit one array per page; we normalize with python into a single array.
-gh api "repos/OWNER/REPO/issues/N/comments" --paginate --jq '.' > /tmp/issue-N-raw.json 2>/dev/null
+# DO NOT suppress gh api stderr with 2>/dev/null — a failed/partial download must fail closed
+# before any attempt/claim computation or task-state change, otherwise an API error could be
+# misread as an empty comment history (yielding attempt=0 / wrong winner).
+if ! gh api "repos/OWNER/REPO/issues/N/comments" --paginate --jq '.' > /tmp/issue-N-raw.json 2>/tmp/issue-N-fetch-err.txt; then
+  echo "ERROR: gh api comment fetch failed; failing closed. stderr:" >&2
+  cat /tmp/issue-N-fetch-err.txt >&2
+  exit 1
+fi
+# An Issue with zero comments still returns '[]' from gh api, so an EMPTY file is never a valid
+# result — it signals a silent failure. Reject it before proceeding.
+if [ ! -s /tmp/issue-N-raw.json ]; then
+  echo "ERROR: comment fetch returned an empty file; failing closed (expected at least '[]')." >&2
+  exit 1
+fi
 python3 -c "
 import json, sys
 raw = open('/tmp/issue-N-raw.json').read()
@@ -163,8 +185,22 @@ while idx < len(raw_stripped):
     idx = end
     while idx < len(raw_stripped) and raw_stripped[idx] in ' \t\n\r':
         idx += 1
+# Validate the combined result is a list of comment records, each with the fields the downstream
+# jq (capture on .body) and claim-winner logic (sort by .created_at, .id) actually consume.
+# A failed/truncated download can surface a GitHub API error object or a partial list; reject both
+# rather than silently treating an error object as 'no attempt markers'.
+if not isinstance(comments, list):
+    sys.stderr.write('ERROR: combined comments payload is not a JSON array; failing closed.\n')
+    sys.exit(1)
+for c in comments:
+    if not isinstance(c, dict) \
+       or not isinstance(c.get('body'), str) \
+       or not isinstance(c.get('id'), int) \
+       or not isinstance(c.get('created_at'), str):
+        sys.stderr.write('ERROR: malformed comment record (missing body/id/created_at); failing closed.\n')
+        sys.exit(1)
 json.dump(comments, sys.stdout)
-" > /tmp/issue-N-comments.json
+" > /tmp/issue-N-comments.json || exit 1
 # Step 2: run jq ONCE on the single combined array
 jq '[.[] | .body | capture("relay:attempt attempt=(?<n>[0-9]+)") | .n | tonumber] | max // 0' /tmp/issue-N-comments.json
 ```
